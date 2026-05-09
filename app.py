@@ -140,7 +140,7 @@ if archivo_reporte and archivos_informes:
             elif '⚠️' in str(val): color = 'background-color: #fff3cd; color: #856404;'
             return color
 
-        st.dataframe(df_resultados.style.applymap(colorear_estados, subset=['Estado Póliza', 'Estado Reserva', 'Detalle']), use_container_width=True)
+        st.dataframe(df_resultados.style.map(colorear_estados, subset=['Estado Póliza', 'Estado Reserva', 'Detalle']), use_container_width=True)
 
 else:
     st.info("Sube el Reporte de Acciones y al menos un documento para comenzar la revisión.")
