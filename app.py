@@ -3,16 +3,15 @@ import pandas as pd
 import pdfplumber
 import docx
 from docx.shared import Pt, RGBColor
-from docx.enum.text import WD_COLOR_INDEX
 import re
 import io
 from datetime import datetime
 
-st.set_page_config(page_title="Auditor de Informes JPV", layout="wide")
-st.title("🔎 Auditor Automático de Informes")
-st.markdown("Revisión avanzada con lectura dinámica de cuadros, exclusión de IVA, cruce de Pérdida Bruta y generación de reportes en Word.")
+st.set_page_config(page_title="Auditor JPV - Comparativa de Montos", layout="wide")
+st.title("🔎 Auditor de Informes: Comparativa vs. Sistema")
+st.markdown("Este módulo compara los montos del Reporte de Acciones contra los declarados en los informes Word/PDF.")
 
-# --- 1. FUNCIONES DE EXTRACCIÓN Y LIMPIEZA ---
+# --- 1. FUNCIONES DE EXTRACCIÓN ---
 def extraer_texto_pdf(archivo):
     texto = ""
     try:
@@ -46,229 +45,149 @@ def limpiar_monto(texto_monto):
     except:
         return 0.0
 
-def buscar_ultimo_valor(patron, texto):
-    matches = re.findall(patron, texto, re.IGNORECASE)
-    return limpiar_monto(matches[-1]) if matches else 0.0
-
-# --- 2. MOTOR ARITMÉTICO DINÁMICO ---
-def extraer_datos_informe(texto):
+def extraer_montos_informe(texto):
+    """Extrae los montos finales buscando patrones en tablas y texto"""
     datos = {
-        "Liquidacion": None, "Poliza": None, "Fecha_Siniestro": None, "Fecha_Denuncia": None,
-        "Total_Bruto_Dinámico": 0.0, "Total_Neto_Dinámico": 0.0,
-        "Honorarios": 0.0, "Gastos": 0.0, "Total_Reserva_Declarado": 0.0,
-        "Errores_Cascada": []
+        "Liquidacion": None, "Poliza": None,
+        "Bruta": 0.0, "Deducible": 0.0, "Neta": 0.0, "Total_Reserva": 0.0
     }
     
-    # Llaves y Forma
+    # Identificación
     match_liq = re.search(r'(?:LIQUIDACI[OÓ]N Nº|Ref\. JPV\s*:)\s*(\d+)', texto, re.IGNORECASE)
     if match_liq: datos["Liquidacion"] = match_liq.group(1).strip()
-        
+    
     match_pol = re.search(r'(?:Nº Póliza|Póliza Nº|Póliza número)[\s:]*([A-Za-z0-9-]+)', texto, re.IGNORECASE)
     if match_pol: datos["Poliza"] = match_pol.group(1).strip()
-        
-    match_fsin = re.search(r'Fecha de Siniestro[\s:]*([\d\-]+)', texto, re.IGNORECASE)
-    if match_fsin: datos["Fecha_Siniestro"] = match_fsin.group(1).strip()
-        
-    match_fden = re.search(r'Fecha Denuncia[\s:]*([\d\-]+)', texto, re.IGNORECASE)
-    if match_fden: datos["Fecha_Denuncia"] = match_fden.group(1).strip()
 
-    # Extracción de montos fijos
-    datos["Honorarios"] = buscar_ultimo_valor(r'Honorarios[^\d]*([\d\.,]+)', texto)
-    datos["Gastos"] = buscar_ultimo_valor(r'Gastos[^\d]*([\d\.,]+)', texto)
-    datos["Total_Reserva_Declarado"] = buscar_ultimo_valor(r'(?:Total reserva recomendada|Total Reserva del siniestro|Total Reserva)[^\d]*([\d\.,]+)', texto)
+    # Buscamos totales en tablas (patrones comunes en tus informes)
+    # Sumamos todas las 'Pérdidas Estimadas' para la Bruta
+    brutas = re.findall(r'(?:Pérdida Estimada|Reserva Determinada)[^\d]*([\d\.,]+)', texto, re.IGNORECASE)
+    datos["Bruta"] = sum([limpiar_monto(m) for m in brutas]) if brutas else 0.0
 
-    # Lógica Dinámica en Cascada (Busca patrones Base - Deducible = Neto)
-    lineas = texto.split('\n')
-    patron_numeros = r'(?<![\w])\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?(?![\w])'
+    # Deducibles
+    deducibles = re.findall(r'(?:Deducible|Deducible Contratado)[^\d]*([\d\.,]+)', texto, re.IGNORECASE)
+    datos["Deducible"] = sum([limpiar_monto(m) for m in deducibles]) if deducibles else 0.0
+
+    # Neta
+    netas = re.findall(r'(?:Reserva Neta|Total Reserva Neta)[^\d]*([\d\.,]+)', texto, re.IGNORECASE)
+    datos["Neta"] = sum([limpiar_monto(m) for m in netas]) if netas else 0.0
+
+    # Total Reserva
+    total = re.findall(r'(?:Total reserva recomendada|Total Reserva del siniestro|Total Reserva)[^\d]*([\d\.,]+)', texto, re.IGNORECASE)
+    datos["Total_Reserva"] = limpiar_monto(total[-1]) if total else 0.0
     
-    for linea in lineas:
-        # Evitar líneas de totales consolidados para no duplicar sumas
-        if "total reserva" in linea.lower(): 
-            continue
-            
-        matches = re.findall(patron_numeros, linea)
-        montos = [limpio for m in matches if (limpio := limpiar_monto(m)) > 0]
-        
-        # Si la línea tiene al menos 3 montos, comprobamos si es una fila de cálculo (Base, Deducible, Neto)
-        if len(montos) >= 3:
-            # Tomamos los últimos 3 números por si la línea incluye "Monto Asegurado" al principio
-            base, deducible, neto = montos[-3], montos[-2], montos[-1]
-            
-            # Verificamos si matemáticamente tiene sentido (Base - Deducible = Neto) con tolerancia
-            if abs((base - deducible) - neto) <= 1.0:
-                datos["Total_Bruto_Dinámico"] += base
-                datos["Total_Neto_Dinámico"] += neto
-            elif abs((base - deducible) - neto) <= (base * 0.5): # Si parece fila de reserva pero está mal restada
-                # Solo alertamos si la palabra pérdida o deducible está cerca para no tomar fechas al azar
-                if "pérdida" in linea.lower() or "deducible" in linea.lower():
-                    datos["Errores_Cascada"].append(f"Error en fila: Base {base:,.2f} - Ded {deducible:,.2f} != {neto:,.2f}")
-
     return datos
 
-# --- 3. CARGA DE BASE MAESTRA INTELIGENTE ---
+# --- 2. CARGA DE EXCEL ---
 def cargar_reporte_acciones(archivo):
     if archivo is None: return None
     for i in range(10):
         try:
-            df_temp = pd.read_excel(archivo, skiprows=i)
-            df_temp.columns = [str(c).strip() for c in df_temp.columns]
-            posibles_nombres = ['Número de caso', 'Numero de caso', 'N° caso', 'Caso']
-            col_found = next((c for c in df_temp.columns if c in posibles_nombres), None)
-            
-            if col_found:
-                df_temp[col_found] = df_temp[col_found].astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
-                df_temp.rename(columns={col_found: 'Llave_Caso'}, inplace=True)
-                return df_temp.dropna(how='all', axis=0)
-        except:
-            continue
+            df = pd.read_excel(archivo, skiprows=i)
+            df.columns = [str(c).strip() for c in df.columns]
+            col_liq = next((c for c in df.columns if 'número de caso' in c.lower() or 'caso' in c.lower()), None)
+            if col_liq:
+                df[col_liq] = df[col_liq].astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
+                df.rename(columns={col_liq: 'Llave'}, inplace=True)
+                return df
+        except: continue
     return None
 
-# --- 4. GENERADOR DE REPORTE WORD ---
-def generar_word_auditoria(resultados):
+# --- 3. GENERADOR DE WORD ---
+def generar_word_comparativo(resultados):
     doc = docx.Document()
-    doc.add_heading('Reporte de Auditoría de Informes - JPV', 0)
-    doc.add_paragraph(f"Fecha de revisión: {datetime.now().strftime('%d-%m-%Y %H:%M')}")
+    doc.add_heading('Auditoría de Montos: Sistema vs. Informe', 0)
     
     for res in resultados:
-        # Título del Caso
-        estado_gral = "⚠️ CON HALLAZGOS" if "❌" in res["Detalle"] or "⚠️" in res["Detalle"] else "✅ APROBADO"
-        heading = doc.add_heading(f"Liquidación: {res['N° Caso']} | {estado_gral}", level=2)
-        doc.add_paragraph(f"Archivo: {res['Documento']}", style='Subtitle')
+        doc.add_heading(f"Liquidación N° {res['Caso']}", level=1)
+        doc.add_paragraph(f"Documento: {res['Archivo']}")
         
-        # Resultados Semáforo
-        p = doc.add_paragraph()
-        p.add_run(f"Forma y Póliza: {res['Validación Forma']}\n")
-        p.add_run(f"Fechas (Sin/Den): {res['Validación Fechas']}\n")
-        p.add_run(f"Aritmética Integral: {res['Aritmética']}\n")
-        p.add_run(f"Cruce Pérdida Bruta: {res['Desviación Reserva']}\n")
+        # Tabla comparativa
+        table = doc.add_table(rows=1, cols=4)
+        table.style = 'Table Grid'
+        hdr_cells = table.rows[0].cells
+        hdr_cells[0].text = 'Concepto'
+        hdr_cells[1].text = 'Sistema (Excel)'
+        hdr_cells[2].text = 'Informe (Doc)'
+        hdr_cells[3].text = 'Diferencia'
         
-        # Detalle de errores
-        if res['Detalle'] and "Auditoría completada" not in res['Detalle']:
-            p_det = doc.add_paragraph("Detalle de las Inconsistencias detectadas:\n", style='Intense Quote')
-            for error in res['Detalle'].split(' | '):
-                r = p_det.add_run(f"• {error}\n")
-                r.font.color.rgb = RGBColor(200, 0, 0) # Texto rojo para errores
-                
-        doc.add_paragraph("_" * 50)
+        conceptos = [
+            ('Pérdida Bruta', res['Bruta_Sist'], res['Bruta_Inf']),
+            ('Deducible', res['Ded_Sist'], res['Ded_Inf']),
+            ('Pérdida Neta', res['Neta_Sist'], res['Neta_Inf']),
+            ('Total Reserva', res['Total_Sist'], res['Total_Inf'])
+        ]
         
+        for nombre, sist, inf in conceptos:
+            row_cells = table.add_row().cells
+            row_cells[0].text = nombre
+            row_cells[1].text = f"{sist:,.2f}"
+            row_cells[2].text = f"{inf:,.2f}"
+            diff = abs(sist - inf)
+            row_cells[3].text = f"{diff:,.2f}"
+            if diff > 1.0:
+                run = row_cells[3].paragraphs[0].runs[0]
+                run.font.color.rgb = RGBColor(255, 0, 0)
+                run.bold = True
+
+        doc.add_paragraph("\n")
+        if res['Alerta_Poliza']:
+            p = doc.add_paragraph()
+            r = p.add_run(f"⚠️ {res['Alerta_Poliza']}")
+            r.font.color.rgb = RGBColor(200, 0, 0)
+            
     buffer = io.BytesIO()
     doc.save(buffer)
     return buffer
 
-# --- INTERFAZ PRINCIPAL ---
-st.sidebar.header("1. Base Maestra")
-archivo_reporte = st.sidebar.file_uploader("Sube el Reporte de Acciones (Excel)", type=["xlsx"])
+# --- INTERFAZ ---
+st.sidebar.header("1. Carga de Datos")
+archivo_excel = st.sidebar.file_uploader("Reporte de Acciones (Excel)", type=["xlsx"])
+archivos_docs = st.sidebar.file_uploader("Informes (Word/PDF)", type=["docx", "pdf"], accept_multiple_files=True)
 
-st.sidebar.header("2. Documentos a Revisar")
-archivos_informes = st.sidebar.file_uploader("Sube los informes (PDF o DOCX)", type=["pdf", "docx"], accept_multiple_files=True)
-
-if archivo_reporte and archivos_informes:
-    df_acciones = cargar_reporte_acciones(archivo_reporte)
+if archivo_excel and archivos_docs:
+    df_sist = cargar_reporte_acciones(archivo_excel)
     
-    if df_acciones is None or 'Llave_Caso' not in df_acciones.columns:
-        st.error("❌ No se encontró la columna 'Número de caso' en el Excel.")
-    else:
-        st.info(f"Base Maestra cargada. Auditando {len(archivos_informes)} informe(s)...")
-        resultados = []
-
-        for archivo in archivos_informes:
-            nombre_arch = archivo.name
-            texto_doc = extraer_texto_pdf(archivo) if nombre_arch.lower().endswith('.pdf') else extraer_texto_docx(archivo)
-            datos = extraer_datos_informe(texto_doc)
-            caso_informe = datos["Liquidacion"]
-
-            if not caso_informe:
-                resultados.append({
-                    "Documento": nombre_arch, "N° Caso": "N/D",
-                    "Validación Fechas": "❌", "Validación Forma": "❌",
-                    "Aritmética": "❌", "Desviación Reserva": "❌",
-                    "Detalle": "❌ No se encontró el N° de Liquidación en el documento."
-                })
-                continue
-
-            filas_match = df_acciones[df_acciones['Llave_Caso'] == caso_informe]
-            
-            if filas_match.empty:
-                resultados.append({
-                    "Documento": nombre_arch, "N° Caso": caso_informe,
-                    "Validación Fechas": "❌", "Validación Forma": "❌",
-                    "Aritmética": "❌", "Desviación Reserva": "❌",
-                    "Detalle": "❌ El caso no existe en el Reporte de Acciones."
-                })
-                continue
-                
-            fila_caso = filas_match.iloc[0]
-            poliza_sistema = str(fila_caso.get('Póliza de seguros', '')).strip()
-            
-            col_fsin = next((c for c in df_acciones.columns if 'siniestro' in c.lower()), None)
-            fsin_sistema = str(fila_caso.get(col_fsin, '')).strip() if col_fsin else ""
-            
-            col_bruta = next((c for c in df_acciones.columns if 'bruta' in c.lower()), None)
-            bruta_sistema_val = limpiar_monto(str(fila_caso.get(col_bruta, '0'))) if col_bruta else 0.0
-
-            alerta_fechas, alerta_forma, alerta_aritmetica, alerta_reserva = "✅ OK", "✅ OK", "✅ OK", "✅ OK"
-            detalles_errores = datos["Errores_Cascada"]
-
-            # 1. FECHAS
-            if datos["Fecha_Siniestro"]:
-                fsin_doc_corta = datos["Fecha_Siniestro"][:10]
-                if fsin_doc_corta not in fsin_sistema:
-                    alerta_fechas = "❌ Error"
-                    detalles_errores.append(f"❌ Fecha Sin: Sist({fsin_sistema}) vs Doc({fsin_doc_corta})")
-
-            # 2. PÓLIZA
-            if poliza_sistema != "nan" and poliza_sistema != "":
-                if datos["Poliza"] and poliza_sistema.upper() not in datos["Poliza"].upper():
-                    alerta_forma = "❌ Error"
-                    detalles_errores.append(f"❌ Póliza: Sist({poliza_sistema}) vs Doc({datos['Poliza']})")
-            
-            # 3. ARITMÉTICA FINAL (Neto + Honorarios + Gastos. SIN IVA)
-            if datos["Total_Neto_Dinámico"] > 0:
-                suma_auditor = datos["Total_Neto_Dinámico"] + datos["Honorarios"] + datos["Gastos"]
-                if abs(suma_auditor - datos["Total_Reserva_Declarado"]) > 1.0:
-                    alerta_aritmetica = "❌ Error"
-                    detalles_errores.append(f"❌ Aritmética final descuadrada (¿IVA incluido?): Suma correcta {suma_auditor:,.2f} vs Tipeado {datos['Total_Reserva_Declarado']:,.2f}")
-
-            # 4. PÉRDIDA BRUTA (Cruce Sistema vs Documento)
-            if datos["Total_Bruto_Dinámico"] > 0:
-                if abs(datos["Total_Bruto_Dinámico"] - bruta_sistema_val) > 1.0 and bruta_sistema_val > 0:
-                    alerta_reserva = "⚠️ Warning"
-                    detalles_errores.append(f"⚠️ Pérdida Bruta: Sist({bruta_sistema_val:,.2f}) difiere de Suma Doc({datos['Total_Bruto_Dinámico']:,.2f})")
-
-            resultados.append({
-                "Documento": nombre_arch, "N° Caso": caso_informe,
-                "Validación Fechas": alerta_fechas, "Validación Forma": alerta_forma,
-                "Aritmética": alerta_aritmetica, "Desviación Reserva": alerta_reserva,
-                "Detalle": " | ".join(detalles_errores) if detalles_errores else "✅ Auditoría completada sin hallazgos."
-            })
-
-        st.subheader("📊 Dashboard de Auditoría Integral")
-        df_resultados = pd.DataFrame(resultados)
+    if df_sist is not None:
+        resultados_finales = []
         
-        def colorear_estados(val):
-            color = ''
-            if '✅' in str(val): color = 'background-color: #d4edda; color: #155724;'
-            elif '❌' in str(val): color = 'background-color: #f8d7da; color: #721c24;'
-            elif '⚠️' in str(val): color = 'background-color: #fff3cd; color: #856404;'
-            return color
+        for archivo in archivos_docs:
+            texto = extraer_texto_pdf(archivo) if archivo.name.endswith('.pdf') else extraer_texto_docx(archivo)
+            inf = extraer_montos_informe(texto)
+            
+            if inf["Liquidacion"]:
+                fila = df_sist[df_sist['Llave'] == inf["Liquidacion"]]
+                if not fila.empty:
+                    f = fila.iloc[0]
+                    # Mapeo dinámico de columnas del Excel
+                    c_bruta = next((c for c in df_sist.columns if 'bruta' in c.lower()), None)
+                    c_neta = next((c for c in df_sist.columns if 'neta' in c.lower()), None)
+                    c_pol = next((c for c in df_sist.columns if 'póliza' in c.lower()), None)
+                    
+                    bruta_s = limpiar_monto(f.get(c_bruta, 0))
+                    neta_s = limpiar_monto(f.get(c_neta, 0))
+                    pol_s = str(f.get(c_pol, '')).strip()
+                    
+                    # El deducible en el sistema suele ser la diferencia
+                    ded_s = bruta_s - neta_s
+                    
+                    alerta_pol = ""
+                    if pol_s and inf["Poliza"] and pol_s not in inf["Poliza"]:
+                        alerta_pol = f"Póliza inconsistente: Sistema dice {pol_s} e informe dice {inf['Poliza']}"
 
-        st.dataframe(
-            df_resultados.style.map(
-                colorear_estados, 
-                subset=['Validación Fechas', 'Validación Forma', 'Aritmética', 'Desviación Reserva']
-            ), 
-            use_container_width=True, hide_index=True
-        )
+                    resultados_finales.append({
+                        "Caso": inf["Liquidacion"], "Archivo": archivo.name,
+                        "Bruta_Sist": bruta_s, "Bruta_Inf": inf["Bruta"],
+                        "Ded_Sist": ded_s, "Ded_Inf": inf["Deducible"],
+                        "Neta_Sist": neta_s, "Neta_Inf": inf["Neta"],
+                        "Total_Sist": neta_s, "Total_Inf": inf["Total_Reserva"], # Ajustar según necesidad de honorarios
+                        "Alerta_Poliza": alerta_pol
+                    })
 
-        st.divider()
-        
-        # Generación y Descarga del Word
-        word_buffer = generar_word_auditoria(resultados)
-        st.download_button(
-            label="📄 Descargar Reporte en Word",
-            data=word_buffer.getvalue(),
-            file_name=f"Auditoria_JPV_{datetime.now().strftime('%d-%m-%y')}.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        )
-else:
-    st.info("👈 Sube tu Reporte de Acciones y los informes a auditar.")
+        if resultados_finales:
+            st.success(f"Se procesaron {len(resultados_finales)} informes con éxito.")
+            word_buf = generar_word_comparativo(resultados_finales)
+            st.download_button("📥 Descargar Reporte Comparativo (Word)", data=word_buf.getvalue(), file_name="Auditoria_Montos_JPV.docx")
+            
+            # Vista previa en tabla
+            st.dataframe(pd.DataFrame(resultados_finales)[["Caso", "Bruta_Sist", "Bruta_Inf", "Neta_Sist", "Neta_Inf"]])
