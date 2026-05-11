@@ -14,9 +14,9 @@ if 'df_maestro' not in st.session_state:
     st.session_state.df_maestro = None
 
 st.title("🔎 Auditor Individual de Informes")
-st.markdown("Revisión uno a uno contra el Reporte de Acciones persistente.")
+st.markdown("Revisión técnica de informes de liquidación contra el Reporte de Acciones.")
 
-# --- 1. FUNCIONES DE EXTRACCIÓN ---
+# --- 1. FUNCIONES DE EXTRACCIÓN Y LIMPIEZA ---
 def extraer_texto_pdf(archivo):
     texto = ""
     try:
@@ -57,21 +57,24 @@ def extraer_datos_informe(texto):
         "Divisa": None, "Perdida_Bruta": 0.0
     }
     
-    # Llave y Forma
+    # 1. Identificación del Caso (Llave)
     match_liq = re.search(r'(?:LIQUIDACI[OÓ]N Nº|Ref\. JPV\s*:)\s*(\d+)', texto, re.IGNORECASE)
     if match_liq: datos["Liquidacion"] = match_liq.group(1).strip()
         
+    # 2. Póliza
     match_pol = re.search(r'(?:Nº Póliza|Póliza Nº|Póliza número)[\s:]*([A-Za-z0-9-]+)', texto, re.IGNORECASE)
     if match_pol: datos["Poliza"] = match_pol.group(1).strip()
     
-    match_comp = re.search(r'(?:ASEGURADOR|Compañía)[\s:]*([^\n|]+)', texto, re.IGNORECASE)
-    if match_comp: datos["Compania"] = match_comp.group(1).strip()
+    # 3. Asegurador (Mejorado para el encabezado)
+    match_comp = re.search(r'(?:ASEGURADOR|COMPAÑ[IÍ]A DE SEGUROS|ASEGURADORA|COMPAÑ[IÍ]A)[\s:]*([^\n|]+)', texto, re.IGNORECASE)
+    if match_comp: 
+        datos["Compania"] = match_comp.group(1).strip().split('|')[0].strip()
 
-    # Ajustador
-    match_ajust = re.search(r'Ajustador a cargo[\s:]*([^\n|]+)', texto, re.IGNORECASE)
+    # 4. Ajustador
+    match_ajust = re.search(r'(?:Ajustador a cargo|Ajustador senior)[\s:]*([^\n|]+)', texto, re.IGNORECASE)
     if match_ajust: datos["Ajustador"] = match_ajust.group(1).strip()
 
-    # Fechas
+    # 5. Fechas
     match_fsin = re.search(r'Fecha de Siniestro[\s:]*([\d\-]+)', texto, re.IGNORECASE)
     if match_fsin: datos["Fecha_Siniestro"] = match_fsin.group(1).strip()
         
@@ -81,191 +84,172 @@ def extraer_datos_informe(texto):
     match_fins = re.search(r'Fecha Inspección[\s:]*([\d\-]+)', texto, re.IGNORECASE)
     if match_fins: datos["Fecha_Inspeccion"] = match_fins.group(1).strip()
 
-    # Monto Bruto (Pérdida Bruta, Reserva Determinada, Pérdida Estimada, Pérdida Probable BF)
-    matches_bruta = re.findall(r'(?:Pérdida Bruta|Reserva Determinada|Pérdida Estimada|Pérdida Probable BF)[^\d]*([\d\.,]+)', texto, re.IGNORECASE)
-    if matches_bruta: datos["Perdida_Bruta"] = limpiar_monto(matches_bruta[-1])
+    # 6. Pérdida Bruta (Equivalencia con Pérdida Probable)
+    # Buscamos todas las menciones de Pérdida Bruta o Probable y sumamos si hay varias partidas (BF/BI)
+    patrones_bruta = [
+        r'(?:Pérdida Bruta|Pérdida Probable|Reserva Determinada|Pérdida Estimada)[^\d]*([\d\.,]+)',
+        r'(?:BF|BI)[^\d]*([\d\.,]+)' # Captura sub-partidas si están cerca de las palabras clave
+    ]
     
-    # Divisa
-    match_div = re.search(r'(UF|US\$|USD|\$)', texto, re.IGNORECASE)
-    if match_div: datos["Divisa"] = match_div.group(1).upper()
+    total_bruta = 0.0
+    # Priorizamos capturar el total si existe, sino sumamos partidas
+    match_total_bruta = re.findall(r'(?:Total Pérdida Bruta|Total Pérdida Probable)[^\d]*([\d\.,]+)', texto, re.IGNORECASE)
+    if match_total_bruta:
+        total_bruta = limpiar_monto(match_total_bruta[-1])
+    else:
+        # Si no hay total explícito, buscamos las líneas de pérdida probable
+        for patron in patrones_bruta:
+            matches = re.findall(patron, texto, re.IGNORECASE)
+            if matches:
+                # Si hay varias (como BF y BI), las sumamos
+                for m in matches:
+                    val = limpiar_monto(m)
+                    if val > total_bruta: # Evitamos duplicar si lee la misma línea dos veces
+                        total_bruta += val
+    
+    datos["Perdida_Bruta"] = total_bruta
+    
+    # 7. Divisa (Detección Robusta)
+    if re.search(r'\bUF\b', texto, re.IGNORECASE):
+        datos["Divisa"] = "UF"
+    elif re.search(r'\b(US\$|USD|D[OÓ]LARES|US \$)\b', texto, re.IGNORECASE):
+        datos["Divisa"] = "US$"
+    elif re.search(r'\b(PESOS|CLP|\$)\b', texto, re.IGNORECASE):
+        datos["Divisa"] = "PESOS"
         
     return datos
 
-# --- 2. GESTIÓN DE LA BASE MAESTRA EN SIDEBAR ---
+# --- 2. GESTIÓN DE LA BASE MAESTRA (SIDEBAR) ---
 with st.sidebar:
     st.header("⚙️ Configuración")
-    archivo_excel = st.file_uploader("Actualizar Reporte de Acciones (Excel)", type=["xlsx"])
+    archivo_excel = st.file_uploader("Cargar/Actualizar Reporte de Acciones", type=["xlsx"])
     
     if archivo_excel:
-        for i in range(10):
+        for i in range(15): # Escaneo profundo de filas
             try:
                 df_temp = pd.read_excel(archivo_excel, skiprows=i)
                 df_temp.columns = [str(c).strip() for c in df_temp.columns]
                 if 'Número de caso' in df_temp.columns:
                     df_temp['Número de caso'] = df_temp['Número de caso'].astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
                     st.session_state.df_maestro = df_temp.dropna(how='all', axis=0)
-                    st.success("✅ Base Maestra cargada y guardada en sesión.")
+                    st.success("✅ Reporte de Acciones cargado.")
                     break
             except: continue
 
     if st.session_state.df_maestro is not None:
-        st.write(f"📊 **Base actual:** {len(st.session_state.df_maestro)} casos registrados.")
-        if st.button("Limpiar Base de Datos"):
+        st.write(f"📊 **Casos en Base:** {len(st.session_state.df_maestro)}")
+        if st.button("Limpiar Memoria"):
             st.session_state.df_maestro = None
             st.rerun()
 
-# --- 3. GENERADOR DE CERTIFICADO INDIVIDUAL (WORD) ---
+# --- 3. GENERADOR DE CERTIFICADO (WORD) ---
 def generar_word_individual(resultado):
     doc = docx.Document()
+    doc.add_heading('CERTIFICADO DE AUDITORÍA JPV', 0)
+    doc.add_paragraph(f"Fecha: {datetime.now().strftime('%d-%m-%Y %H:%M')}")
     
-    doc.add_heading('CERTIFICADO DE AUDITORÍA - REVISIÓN INDIVIDUAL', 0)
-    doc.add_paragraph(f"Fecha de Emisión: {datetime.now().strftime('%d-%m-%Y %H:%M')}\nAuditoría Realizada por: Módulo de Control Automático JPV")
-    
-    doc.add_heading('1. DATOS DEL CASO AUDITADO', level=1)
-    doc.add_paragraph(f"Liquidación Nº (Caso): {resultado['N° Caso']}\nDocumento Revisado: {resultado['Documento']}\nAjustador Senior Asignado: {resultado['Ajustador_Sistema']}", style='List Bullet')
+    doc.add_heading('1. DATOS DEL INFORME', level=1)
+    doc.add_paragraph(f"Liquidación Nº: {resultado['N° Caso']}\nAjustador: {resultado['Ajustador_Sistema']}\nArchivo: {resultado['Documento']}")
 
-    estado_gral = "❌ CON OBSERVACIONES" if "ERROR" in resultado['Validación Forma'] or "ERROR" in resultado['Validación Fechas'] or "DESVIACIÓN" in resultado['Desviación Reserva'] else "✅ APROBADO"
-    doc.add_heading(f'2. RESULTADOS DE LA AUDITORÍA: {estado_gral}', level=1)
+    estado = "❌ OBSERVADO" if resultado['Detalles_Criticos'] else "✅ APROBADO"
+    doc.add_heading(f'2. RESULTADO: {estado}', level=1)
 
-    # A. IDENTIFICACIÓN Y FORMA
-    doc.add_heading('A. IDENTIFICACIÓN Y FORMA', level=2)
-    doc.add_paragraph(f"Compañía de Seguros: {resultado['Compania']}", style='List Bullet')
-    doc.add_paragraph(f"Ajustador Firmante: {resultado['Ajustador']}", style='List Bullet')
-    p_poliza = doc.add_paragraph(style='List Bullet')
-    p_poliza.add_run(f"Póliza de Seguros: {resultado['Validación Forma']}")
-    if "ERROR" in resultado['Validación Forma']:
-        for det in resultado['Detalles_Forma']:
-            p_det = doc.add_paragraph(f"  • {det}")
-            p_det.runs[0].font.color.rgb = RGBColor(200, 0, 0)
+    sections = [
+        ("Identificación y Forma", resultado['Detalles_Forma']),
+        ("Cronología", resultado['Detalles_Fechas']),
+        ("Financiera y Moneda", resultado['Detalles_Bruta'])
+    ]
 
-    # B. REVISIÓN CRONOLÓGICA
-    doc.add_heading('B. REVISIÓN CRONOLÓGICA', level=2)
-    p_fecha = doc.add_paragraph(style='List Bullet')
-    p_fecha.add_run(f"Fechas (Ocurrencia/Denuncia/Inspección): {resultado['Validación Fechas']}")
-    if "ERROR" in resultado['Validación Fechas']:
-        for det in resultado['Detalles_Fechas']:
-            p_det = doc.add_paragraph(f"  • {det}")
-            p_det.runs[0].font.color.rgb = RGBColor(200, 0, 0)
-
-    # C. REVISIÓN FINANCIERA Y MONEDA
-    doc.add_heading('C. REVISIÓN FINANCIERA Y MONEDA', level=2)
-    doc.add_paragraph(f"Divisa: {resultado['Divisa']}", style='List Bullet')
-    p_bruta = doc.add_paragraph(style='List Bullet')
-    p_bruta.add_run(f"Pérdida Bruta: {resultado['Desviación Reserva']}")
-    if "DESVIACIÓN" in resultado['Desviación Reserva']:
-        for det in resultado['Detalles_Bruta']:
-            p_det = doc.add_paragraph(f"  • {det}")
-            p_det.runs[0].font.color.rgb = RGBColor(200, 100, 0)
-
-    doc.add_paragraph("\nAcción Requerida: " + ("Se solicita al ajustador la rectificación de los puntos marcados antes de la emisión final." if estado_gral != "✅ APROBADO" else "El informe cumple con los estándares revisados."))
+    for titulo, errores in sections:
+        doc.add_heading(titulo, level=2)
+        if not errores:
+            doc.add_paragraph("✅ Sin observaciones detectadas.")
+        else:
+            for err in errores:
+                p = doc.add_paragraph(style='List Bullet')
+                run = p.add_run(err)
+                run.font.color.rgb = RGBColor(200, 0, 0)
 
     buffer = io.BytesIO()
     doc.save(buffer)
     return buffer
 
-# --- 4. FLUJO DE AUDITORÍA PRINCIPAL ---
+# --- 4. FLUJO DE AUDITORÍA ---
 if st.session_state.df_maestro is not None:
-    st.subheader("📄 Sube el Informe a Revisar")
-    archivo_informe = st.file_uploader("Sube un único Informe (PDF o DOCX)", type=["pdf", "docx"])
+    st.subheader("📄 Subir Informe para Revisión Individual")
+    archivo_informe = st.file_uploader("Sube el Informe (PDF o DOCX)", type=["pdf", "docx"])
 
     if archivo_informe:
         texto = extraer_texto_pdf(archivo_informe) if archivo_informe.name.lower().endswith('.pdf') else extraer_texto_docx(archivo_informe)
         datos_doc = extraer_datos_informe(texto)
         
         if not datos_doc["Liquidacion"]:
-            st.error("❌ No se pudo detectar el número de liquidación en el documento.")
+            st.error("❌ No se detectó el N° de Liquidación en el documento.")
         else:
             df = st.session_state.df_maestro
             fila = df[df['Número de caso'] == datos_doc["Liquidacion"]]
             
             if fila.empty:
-                st.warning(f"⚠️ El caso {datos_doc['Liquidacion']} no se encuentra en el Reporte de Acciones.")
+                st.warning(f"⚠️ El caso {datos_doc['Liquidacion']} no figura en el Reporte de Acciones.")
             else:
                 fila = fila.iloc[0]
-                
-                detalles_forma = []
-                detalles_fechas = []
-                detalles_bruta = []
-                
-                # --- A. IDENTIFICACIÓN Y FORMA ---
-                v_forma = "✅ OK"
+                detalles_forma, detalles_fechas, detalles_bruta = [], [], []
+
+                # Cruce de Póliza
                 poliza_sist = str(fila.get('Póliza de seguros', '')).strip()
-                if poliza_sist.upper() not in str(datos_doc["Poliza"]).upper() and poliza_sist != "nan" and poliza_sist != "":
-                    v_forma = "❌ ERROR"
-                    detalles_forma.append(f"Documento indica: {datos_doc['Poliza']} | Sistema indica: {poliza_sist}")
+                if poliza_sist.upper() not in str(datos_doc["Poliza"]).upper() and poliza_sist != "nan":
+                    detalles_forma.append(f"Póliza: Sist({poliza_sist}) vs Doc({datos_doc['Poliza']})")
                 
-                comp_sist = str(fila.get('Compañía de seguros', '')).strip()
-                v_comp = "✅ OK" if (comp_sist.upper() in str(datos_doc["Compania"]).upper() or not datos_doc["Compania"]) else "❌ ERROR"
-                if v_comp == "❌ ERROR": detalles_forma.append(f"Compañía en Doc: {datos_doc['Compania']} | Sist: {comp_sist}")
+                # Cruce de Asegurador (Coincidencia Parcial)
+                comp_sist = str(fila.get('Compañía de seguros', '')).strip().upper()
+                if datos_doc["Compania"] and comp_sist not in datos_doc["Compania"].upper():
+                    detalles_forma.append(f"Asegurador: Sist({comp_sist}) vs Doc({datos_doc['Compania']})")
 
-                ajust_sist = str(fila.get('Ajustador senior', '')).strip()
-                v_ajust = "✅ OK" if (ajust_sist.upper() in str(datos_doc["Ajustador"]).upper() or not datos_doc["Ajustador"]) else "⚠️ WARNING"
+                # Cruce de Fechas
+                for campo_doc, campo_sist, etiqueta in [
+                    ("Fecha_Siniestro", "Fecha de ocurrencia", "Siniestro"),
+                    ("Fecha_Denuncia", "Fecha de denuncio", "Denuncio"),
+                    ("Fecha_Inspeccion", "Fecha de inspección", "Inspección")
+                ]:
+                    val_sist = str(fila.get(campo_sist, '')).strip()
+                    if datos_doc[campo_doc] and datos_doc[campo_doc][:10] not in val_sist:
+                        detalles_fechas.append(f"{etiqueta}: Sist({val_sist}) vs Doc({datos_doc[campo_doc]})")
 
-                # --- B. FECHAS ---
-                v_fechas = "✅ OK"
-                f_ocurr = str(fila.get('Fecha de ocurrencia', '')).strip()
-                if datos_doc["Fecha_Siniestro"] and datos_doc["Fecha_Siniestro"][:10] not in f_ocurr:
-                    v_fechas = "❌ ERROR"
-                    detalles_fechas.append(f"Ocurrencia: Doc({datos_doc['Fecha_Siniestro'][:10]}) vs Sist({f_ocurr})")
-
-                f_denun = str(fila.get('Fecha de denuncio', '')).strip()
-                if datos_doc["Fecha_Denuncia"] and datos_doc["Fecha_Denuncia"][:10] not in f_denun:
-                    v_fechas = "❌ ERROR"
-                    detalles_fechas.append(f"Denuncio: Doc({datos_doc['Fecha_Denuncia'][:10]}) vs Sist({f_denun})")
-
-                f_insp = str(fila.get('Fecha de inspección', '')).strip()
-                if datos_doc["Fecha_Inspeccion"] and datos_doc["Fecha_Inspeccion"][:10] not in f_insp:
-                    v_fechas = "❌ ERROR"
-                    detalles_fechas.append(f"Inspección: Doc({datos_doc['Fecha_Inspeccion'][:10]}) vs Sist({f_insp})")
-
-                # --- C. FINANCIERA ---
-                v_bruta = "✅ OK"
+                # Cruce Financiero (Pérdida Bruta)
                 bruta_sist = limpiar_monto(fila.get('Perdida bruta (en moneda del caso)', 0))
-                if abs(datos_doc["Perdida_Bruta"] - bruta_sist) > 1.0 and bruta_sist > 0:
-                    v_bruta = "⚠️ DESVIACIÓN DETECTADA"
-                    detalles_bruta.append(f"Monto Doc: {datos_doc['Perdida_Bruta']:,.2f} | Monto Sist: {bruta_sist:,.2f}")
+                if abs(datos_doc["Perdida_Bruta"] - bruta_sist) > 1.0:
+                    detalles_bruta.append(f"Monto Bruto: Sist({bruta_sist:,.2f}) vs Doc({datos_doc['Perdida_Bruta']:,.2f})")
 
-                div_sist = str(fila.get('Divisa', '')).strip()
-                v_div = "✅ OK" if (div_sist.upper() in str(datos_doc["Divisa"]).upper()) else "❌ ERROR"
-                if v_div == "❌ ERROR": detalles_bruta.append(f"Divisa Doc: {datos_doc['Divisa']} | Sist: {div_sist}")
+                div_sist = str(fila.get('Divisa', '')).strip().upper()
+                if datos_doc["Divisa"] and div_sist != datos_doc["Divisa"]:
+                    detalles_bruta.append(f"Divisa: Sist({div_sist}) vs Doc({datos_doc['Divisa']})")
 
-                # --- RESULTADO FINAL ---
-                resultado_final = {
+                # Resultados
+                res_final = {
                     "Documento": archivo_informe.name,
                     "N° Caso": datos_doc["Liquidacion"],
-                    "Ajustador_Sistema": ajust_sist,
-                    "Validación Forma": v_forma,
+                    "Ajustador_Sistema": fila.get('Ajustador senior', 'N/A'),
                     "Detalles_Forma": detalles_forma,
-                    "Compania": f"{v_comp} ({datos_doc['Compania']})",
-                    "Ajustador": f"{v_ajust} ({datos_doc['Ajustador']})",
-                    "Validación Fechas": v_fechas,
                     "Detalles_Fechas": detalles_fechas,
-                    "Desviación Reserva": v_bruta,
                     "Detalles_Bruta": detalles_bruta,
-                    "Divisa": f"{v_div} ({datos_doc['Divisa']})"
+                    "Detalles_Criticos": detalles_forma + detalles_fechas,
+                    "Compania": datos_doc["Compania"],
+                    "Ajustador": datos_doc["Ajustador"],
+                    "Divisa": datos_doc["Divisa"]
                 }
 
-                # Pantalla
-                estado_visual = "✅ Aprobado" if "ERROR" not in v_forma and "ERROR" not in v_fechas and "DESVIACIÓN" not in v_bruta else "❌ Con Observaciones"
-                st.success(f"Auditoría del caso {datos_doc['Liquidacion']} completada. Estado: {estado_visual}")
-                
+                st.success("Auditoría Finalizada.")
                 col1, col2, col3 = st.columns(3)
-                col1.metric("Forma y Póliza", "❌ Error" if detalles_forma else "✅ OK")
-                col2.metric("Fechas", "❌ Error" if detalles_fechas else "✅ OK")
-                col3.metric("Pérdida Bruta", "⚠️ Desviación" if detalles_bruta else "✅ OK")
+                col1.metric("Forma", "❌" if detalles_forma else "✅")
+                col2.metric("Fechas", "❌" if detalles_fechas else "✅")
+                col3.metric("Monto Bruto", "⚠️" if detalles_bruta else "✅")
 
                 if detalles_forma or detalles_fechas or detalles_bruta:
-                    st.error("📋 Hallazgos detectados:")
-                    for d in detalles_forma + detalles_fechas + detalles_bruta:
-                        st.write(f"• {d}")
+                    st.error("Observaciones encontradas:")
+                    for d in detalles_forma + detalles_fechas + detalles_bruta: st.write(f"• {d}")
 
-                # Descarga
-                word_buf = generar_word_individual(resultado_final)
-                st.download_button(
-                    label="📄 Descargar Certificado de Auditoría (Word)",
-                    data=word_buf.getvalue(),
-                    file_name=f"Auditoria_{datos_doc['Liquidacion']}.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                )
+                # Botón Word
+                word_buf = generar_word_individual(res_final)
+                st.download_button("📄 Descargar Certificado Word", word_buf.getvalue(), f"Auditoria_{datos_doc['Liquidacion']}.docx")
 else:
-    st.info("👈 Por favor, carga primero el Reporte de Acciones en la barra lateral para comenzar.")
+    st.info("👈 Sube primero el Reporte de Acciones en la barra lateral.")
