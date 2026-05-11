@@ -12,12 +12,11 @@ from datetime import datetime
 
 st.set_page_config(page_title="Auditor JPV - Revisión Individual", layout="wide")
 
-# Estado de sesión (Persistencia de la Base Maestra)
 if 'df_maestro' not in st.session_state:
     st.session_state.df_maestro = None
 
 st.title("🔎 Auditor Individual de Informes")
-st.markdown("Revisión técnica de informes de liquidación contra el Reporte de Acciones.")
+st.markdown("Revisión técnica exhaustiva de informes de liquidación contra el Reporte de Acciones.")
 
 # ==============================================================================
 # ### --- BLOQUE 1: FUNCIONES DE EXTRACCIÓN DE TEXTO BASE --- ###
@@ -50,8 +49,15 @@ def extraer_texto_docx(archivo):
 # ### --- BLOQUE 2: MOTOR LÓGICO Y EXTRACCIÓN DE DATOS (REGEX) --- ###
 # ==============================================================================
 def limpiar_monto(texto_monto):
-    if not texto_monto: return 0.0
-    limpio = re.sub(r'[^\d,\.-]', '', str(texto_monto))
+    if not texto_monto or pd.isna(texto_monto): return 0.0
+    if isinstance(texto_monto, (int, float)): return float(texto_monto)
+    
+    # Extrae solo la parte numérica con puntos y comas
+    match = re.search(r'[\d\.,]+', str(texto_monto))
+    if not match: return 0.0
+    limpio = match.group(0)
+    
+    # Formato Chileno a Float computacional: 1.500.000,50 -> 1500000.50
     limpio = limpio.replace('.', '').replace(',', '.')
     try:
         return float(limpio)
@@ -62,61 +68,36 @@ def extraer_datos_informe(texto):
     datos = {
         "Liquidacion": None, "Poliza": None, "Compania": None, "Ajustador": None,
         "Fecha_Siniestro": None, "Fecha_Denuncia": None,
-        "Divisa": None, "Perdida_Bruta": 0.0
+        "Divisa": None, "Perdida_Bruta": 0.0, "Texto_Monto_Crudo": ""
     }
     
-    # 1. Identificación del Caso (Llave)
     match_liq = re.search(r'(?:LIQUIDACI[OÓ]N Nº|Ref\. JPV\s*:)\s*(\d+)', texto, re.IGNORECASE)
     if match_liq: datos["Liquidacion"] = match_liq.group(1).strip()
         
-    # 2. Póliza
     match_pol = re.search(r'(?:Nº Póliza|Póliza Nº|Póliza número)[\s:]*([A-Za-z0-9-]+)', texto, re.IGNORECASE)
     if match_pol: datos["Poliza"] = match_pol.group(1).strip()
     
-    # 3. Asegurador
     match_comp = re.search(r'(?:ASEGURADOR|COMPAÑ[IÍ]A DE SEGUROS|ASEGURADORA|COMPAÑ[IÍ]A)[\s:]*([^\n|]+)', texto, re.IGNORECASE)
-    if match_comp: 
-        datos["Compania"] = match_comp.group(1).strip().split('|')[0].strip()
+    if match_comp: datos["Compania"] = match_comp.group(1).strip().split('|')[0].strip()
 
-    # 4. Ajustador / Firmante
-    match_ajust = re.search(r'(?:Ajustador a cargo|Ajustador senior)[\s:]*([^\n|]+)', texto, re.IGNORECASE)
+    match_ajust = re.search(r'(?:Ajustador a cargo|Ajustador senior|Ajustador|Firmante)[\s:]*([A-Za-z\s\.]+)', texto, re.IGNORECASE)
     if match_ajust: datos["Ajustador"] = match_ajust.group(1).strip()
 
-    # 5. Fechas
     match_fsin = re.search(r'Fecha de Siniestro[\s:]*([\d\-]+)', texto, re.IGNORECASE)
     if match_fsin: datos["Fecha_Siniestro"] = match_fsin.group(1).strip()
         
     match_fden = re.search(r'Fecha Denuncia[\s:]*([\d\-]+)', texto, re.IGNORECASE)
     if match_fden: datos["Fecha_Denuncia"] = match_fden.group(1).strip()
 
-    # 6. Pérdida Bruta (Equivalencia con Pérdida Probable)
-    patrones_bruta = [
-        r'(?:Pérdida Bruta|Pérdida Probable|Reserva Determinada|Pérdida Estimada)[^\d]*([\d\.,]+)',
-        r'(?:BF|BI)[^\d]*([\d\.,]+)'
-    ]
+    # Corrección de Montos: Buscar la última aparición explícita para evitar sumas duplicadas
+    matches_bruta = re.findall(r'(?:Pérdida Bruta|Pérdida Probable|Reserva Determinada|Pérdida Estimada)[^\d]*([\d\.,]+)', texto, re.IGNORECASE)
+    if matches_bruta:
+        datos["Texto_Monto_Crudo"] = matches_bruta[-1] # Guardamos el texto exacto capturado para diagnóstico
+        datos["Perdida_Bruta"] = limpiar_monto(matches_bruta[-1])
     
-    total_bruta = 0.0
-    match_total_bruta = re.findall(r'(?:Total Pérdida Bruta|Total Pérdida Probable)[^\d]*([\d\.,]+)', texto, re.IGNORECASE)
-    if match_total_bruta:
-        total_bruta = limpiar_monto(match_total_bruta[-1])
-    else:
-        for patron in patrones_bruta:
-            matches = re.findall(patron, texto, re.IGNORECASE)
-            if matches:
-                for m in matches:
-                    val = limpiar_monto(m)
-                    if val > total_bruta: 
-                        total_bruta += val
-    
-    datos["Perdida_Bruta"] = total_bruta
-    
-    # 7. Divisa (Detección Robusta)
-    if re.search(r'\bUF\b', texto, re.IGNORECASE):
-        datos["Divisa"] = "UF"
-    elif re.search(r'\b(US\$|USD|D[OÓ]LARES|US \$)\b', texto, re.IGNORECASE):
-        datos["Divisa"] = "US$"
-    elif re.search(r'\b(PESOS|CLP|\$)\b', texto, re.IGNORECASE):
-        datos["Divisa"] = "PESOS"
+    if re.search(r'\bUF\b', texto, re.IGNORECASE): datos["Divisa"] = "UF"
+    elif re.search(r'\b(US\$|USD|D[OÓ]LARES|US \$)\b', texto, re.IGNORECASE): datos["Divisa"] = "US$"
+    elif re.search(r'\b(PESOS|CLP|\$)\b', texto, re.IGNORECASE): datos["Divisa"] = "PESOS"
         
     return datos
 
@@ -157,19 +138,20 @@ def generar_word_individual(resultado):
     doc.add_paragraph(f"Liquidación Nº: {resultado['N° Caso']}\nArchivo: {resultado['Documento']}")
 
     estado = "❌ OBSERVADO" if resultado['Detalles_Criticos'] else "✅ APROBADO"
-    doc.add_heading(f'2. RESULTADO: {estado}', level=1)
+    doc.add_heading(f'2. RESULTADO DETALLADO: {estado}', level=1)
 
     sections = [
-        ("Póliza y Compañía", resultado['Detalles_Forma']),
-        ("Firmas / Ajustador", resultado['Detalles_Firmas']),
+        ("Póliza de Seguros", resultado['Detalles_Poliza']),
+        ("Compañía de Seguros", resultado['Detalles_Compania']),
+        ("Firma / Ajustador Senior", resultado['Detalles_Firmas']),
         ("Fechas (Siniestro y Denuncia)", resultado['Detalles_Fechas']),
-        ("Financiera y Moneda", resultado['Detalles_Bruta'])
+        ("Financiera (Pérdida Bruta y Divisa)", resultado['Detalles_Monto'])
     ]
 
     for titulo, errores in sections:
         doc.add_heading(titulo, level=2)
         if not errores:
-            doc.add_paragraph("✅ Sin observaciones detectadas.")
+            doc.add_paragraph("✅ Sin observaciones detectadas. Coincide con sistema.")
         else:
             for err in errores:
                 p = doc.add_paragraph(style='List Bullet')
@@ -201,65 +183,75 @@ if st.session_state.df_maestro is not None:
                 st.warning(f"⚠️ El caso {datos_doc['Liquidacion']} no figura en el Reporte de Acciones.")
             else:
                 fila = fila.iloc[0]
-                detalles_forma, detalles_firmas, detalles_fechas, detalles_bruta = [], [], [], []
+                
+                # Arrays separados rigurosamente para cada análisis
+                detalles_poliza = []
+                detalles_compania = []
+                detalles_firmas = []
+                detalles_fechas = []
+                detalles_monto = []
 
-                # Cruce de Póliza
+                # 1. Cruce de Póliza Separado
                 poliza_sist = str(fila.get('Póliza de seguros', '')).strip()
                 if poliza_sist.upper() not in str(datos_doc["Poliza"]).upper() and poliza_sist != "nan" and poliza_sist != "":
-                    detalles_forma.append(f"Póliza: Sist({poliza_sist}) vs Doc({datos_doc['Poliza']})")
+                    detalles_poliza.append(f"Póliza: Sist({poliza_sist}) vs Doc({datos_doc['Poliza']})")
                 
-                # Cruce de Asegurador
+                # 2. Cruce de Asegurador Separado
                 comp_sist = str(fila.get('Compañía de seguros', '')).strip().upper()
                 if datos_doc["Compania"] and comp_sist not in datos_doc["Compania"].upper():
-                    detalles_forma.append(f"Asegurador: Sist({comp_sist}) vs Doc({datos_doc['Compania']})")
+                    detalles_compania.append(f"Asegurador: Sist({comp_sist}) vs Doc({datos_doc['Compania']})")
 
-                # Cruce de Firmas / Ajustador
+                # 3. Cruce de Firmas / Ajustador Separado
                 ajust_sist = str(fila.get('Ajustador senior', '')).strip().upper()
                 if datos_doc["Ajustador"] and ajust_sist not in datos_doc["Ajustador"].upper() and ajust_sist != "NAN":
-                    detalles_firmas.append(f"Firma Ajustador: Sist({ajust_sist}) vs Doc({datos_doc['Ajustador']})")
+                    detalles_firmas.append(f"Ajustador: Sist({ajust_sist}) vs Doc({datos_doc['Ajustador']})")
 
-                # Cruce de Fechas Exactas
+                # 4. Cruce de Fechas Exactas Separado
                 f_ocurr = str(fila.get('Fecha de ocurrencia', '')).strip()
                 if datos_doc["Fecha_Siniestro"] and datos_doc["Fecha_Siniestro"][:10] not in f_ocurr:
-                    detalles_fechas.append(f"Ocurrencia: Sist({f_ocurr}) vs Doc({datos_doc['Fecha_Siniestro']})")
+                    detalles_fechas.append(f"Fecha Ocurrencia: Sist({f_ocurr}) vs Doc({datos_doc['Fecha_Siniestro']})")
 
                 f_denun = str(fila.get('Fecha de denuncio', '')).strip()
                 if datos_doc["Fecha_Denuncia"] and datos_doc["Fecha_Denuncia"][:10] not in f_denun:
-                    detalles_fechas.append(f"Denuncio: Sist({f_denun}) vs Doc({datos_doc['Fecha_Denuncia']})")
+                    detalles_fechas.append(f"Fecha Denuncio: Sist({f_denun}) vs Doc({datos_doc['Fecha_Denuncia']})")
 
-                # Cruce Financiero (Pérdida Bruta)
+                # 5. Cruce Financiero y Monto Separado
                 bruta_sist = limpiar_monto(fila.get('Perdida bruta (en moneda del caso)', 0))
                 if abs(datos_doc["Perdida_Bruta"] - bruta_sist) > 1.0:
-                    detalles_bruta.append(f"Monto Bruto: Sist({bruta_sist:,.2f}) vs Doc({datos_doc['Perdida_Bruta']:,.2f})")
+                    detalles_monto.append(f"Monto Bruto: Sist({bruta_sist:,.2f}) vs Doc({datos_doc['Perdida_Bruta']:,.2f}) [Texto extraído: '{datos_doc['Texto_Monto_Crudo']}']")
 
                 div_sist = str(fila.get('Divisa', '')).strip().upper()
-                if datos_doc["Divisa"] and div_sist != datos_doc["Divisa"]:
-                    detalles_bruta.append(f"Divisa: Sist({div_sist}) vs Doc({datos_doc['Divisa']})")
+                if datos_doc["Divisa"] and div_sist != datos_doc["Divisa"] and div_sist != "NAN":
+                    detalles_monto.append(f"Divisa: Sist({div_sist}) vs Doc({datos_doc['Divisa']})")
 
-                # Resultados
+                # Consolidación de Resultados
+                todos_los_errores = detalles_poliza + detalles_compania + detalles_firmas + detalles_fechas + detalles_monto
+                
                 res_final = {
                     "Documento": archivo_informe.name,
                     "N° Caso": datos_doc["Liquidacion"],
-                    "Detalles_Forma": detalles_forma,
+                    "Detalles_Poliza": detalles_poliza,
+                    "Detalles_Compania": detalles_compania,
                     "Detalles_Firmas": detalles_firmas,
                     "Detalles_Fechas": detalles_fechas,
-                    "Detalles_Bruta": detalles_bruta,
-                    "Detalles_Criticos": detalles_forma + detalles_fechas + detalles_firmas + detalles_bruta,
+                    "Detalles_Monto": detalles_monto,
+                    "Detalles_Criticos": todos_los_errores
                 }
 
-                estado_visual = "❌ Con Observaciones" if res_final["Detalles_Criticos"] else "✅ Aprobado"
+                estado_visual = "❌ Con Observaciones" if todos_los_errores else "✅ Aprobado"
                 st.success(f"Auditoría Finalizada. Estado: {estado_visual}")
                 
-                # Métricas visuales explícitas
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Póliza/Cía", "❌" if detalles_forma else "✅")
-                c2.metric("Ajustador", "❌" if detalles_firmas else "✅")
-                c3.metric("Fechas", "❌" if detalles_fechas else "✅")
-                c4.metric("Monto/Divisa", "⚠️" if detalles_bruta else "✅")
+                # Métricas visuales desglosadas al 100%
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Póliza", "❌" if detalles_poliza else "✅")
+                c2.metric("Compañía", "❌" if detalles_compania else "✅")
+                c3.metric("Firma", "❌" if detalles_firmas else "✅")
+                c4.metric("Fechas", "❌" if detalles_fechas else "✅")
+                c5.metric("Monto/Divisa", "❌" if detalles_monto else "✅")
 
-                if res_final["Detalles_Criticos"]:
+                if todos_los_errores:
                     st.error("Observaciones encontradas:")
-                    for d in res_final["Detalles_Criticos"]: st.write(f"• {d}")
+                    for d in todos_los_errores: st.write(f"• {d}")
 
                 # Botón Word
                 word_buf = generar_word_individual(res_final)
