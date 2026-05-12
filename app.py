@@ -52,7 +52,6 @@ def limpiar_monto(texto_monto):
     if not texto_monto or pd.isna(texto_monto): return 0.0
     if isinstance(texto_monto, (int, float)): return float(texto_monto)
     
-    # Extrae solo la parte numérica con puntos y comas
     match = re.search(r'[\d\.,]+', str(texto_monto))
     if not match: return 0.0
     limpio = match.group(0)
@@ -66,35 +65,59 @@ def limpiar_monto(texto_monto):
 
 def extraer_datos_informe(texto):
     datos = {
-        "Liquidacion": None, "Poliza": None, "Compania": None, "Ajustador": None,
+        "Liquidacion": None, "Poliza": None, "Compania": None, "Corredora": None,
+        "Ajustador": None, "Asegurado": None, "Direccion": None, "Comuna": None, "Region": None,
         "Fecha_Siniestro": None, "Fecha_Denuncia": None,
         "Divisa": None, "Perdida_Bruta": 0.0, "Texto_Monto_Crudo": ""
     }
     
-    match_liq = re.search(r'(?:LIQUIDACI[OÓ]N Nº|Ref\. JPV\s*:)\s*(\d+)', texto, re.IGNORECASE)
+    # 1. Identificación del Caso (Llave)
+    match_liq = re.search(r'(?:LIQUIDACI[OÓ]N Nº|Ref\. JPV\s*:|SINIESTRO Nº.+(?:/|-)\s*LIQUIDACI[OÓ]N Nº)[\s:\|]*(\d+)', texto, re.IGNORECASE)
     if match_liq: datos["Liquidacion"] = match_liq.group(1).strip()
         
-    match_pol = re.search(r'(?:Nº Póliza|Póliza Nº|Póliza número)[\s:]*([A-Za-z0-9-]+)', texto, re.IGNORECASE)
+    # 2. Póliza
+    match_pol = re.search(r'(?:Nº Póliza|Póliza Nº|Póliza número)[\s:\|]+([A-Za-z0-9-]+)', texto, re.IGNORECASE)
     if match_pol: datos["Poliza"] = match_pol.group(1).strip()
     
-    match_comp = re.search(r'(?:ASEGURADOR|COMPAÑ[IÍ]A DE SEGUROS|ASEGURADORA|COMPAÑ[IÍ]A)[\s:]*([^\n|]+)', texto, re.IGNORECASE)
-    if match_comp: datos["Compania"] = match_comp.group(1).strip().split('|')[0].strip()
+    # 3. Aseguradora (Solo en el encabezado)
+    match_comp = re.search(r'ASEGURADOR[\s:\|]+([^\|\n]+)', texto, re.IGNORECASE)
+    if match_comp: datos["Compania"] = match_comp.group(1).strip()
 
-    match_ajust = re.search(r'(?:Ajustador a cargo|Ajustador senior|Ajustador|Firmante)[\s:]*([A-Za-z\s\.]+)', texto, re.IGNORECASE)
+    # 4. Corredora de Seguros
+    match_corr = re.search(r'(?:Corredor|Corredora|Corredor de Seguros)[\s:\|]+([^\|\n]+)', texto, re.IGNORECASE)
+    if match_corr: datos["Corredora"] = match_corr.group(1).strip()
+
+    # 5. Datos del Asegurado y Ubicación
+    match_aseg = re.search(r'Asegurado[\s:\|]+([^\|\n]+)', texto, re.IGNORECASE)
+    if match_aseg: datos["Asegurado"] = match_aseg.group(1).strip()
+
+    match_dir = re.search(r'(?:Dirección Siniestro|Dirección)[\s:\|]+([^\|\n]+)', texto, re.IGNORECASE)
+    if match_dir: datos["Direccion"] = match_dir.group(1).strip()
+
+    match_comuna = re.search(r'Comuna[\s:\|]+([^\|\n]+)', texto, re.IGNORECASE)
+    if match_comuna: datos["Comuna"] = match_comuna.group(1).strip()
+
+    match_reg = re.search(r'(Regi[oó]n[^\|\n]*)', texto, re.IGNORECASE)
+    if match_reg: datos["Region"] = match_reg.group(1).strip()
+
+    # 6. Ajustador (Acepta "a cargo" o "senior")
+    match_ajust = re.search(r'(?:Ajustador a cargo|Ajustador senior)[\s:\|]+([^\|\n]+)', texto, re.IGNORECASE)
     if match_ajust: datos["Ajustador"] = match_ajust.group(1).strip()
 
-    match_fsin = re.search(r'Fecha de Siniestro[\s:]*([\d\-]+)', texto, re.IGNORECASE)
+    # 7. Fechas
+    match_fsin = re.search(r'Fecha de Siniestro[\s:\|]+([\d\-]+)', texto, re.IGNORECASE)
     if match_fsin: datos["Fecha_Siniestro"] = match_fsin.group(1).strip()
         
-    match_fden = re.search(r'Fecha Denuncia[\s:]*([\d\-]+)', texto, re.IGNORECASE)
+    match_fden = re.search(r'Fecha Denuncia[\s:\|]+([\d\-]+)', texto, re.IGNORECASE)
     if match_fden: datos["Fecha_Denuncia"] = match_fden.group(1).strip()
 
-    # Corrección de Montos: Buscar la última aparición explícita para evitar sumas duplicadas
+    # 8. Pérdida Bruta (Equivalencia con Pérdida Probable)
     matches_bruta = re.findall(r'(?:Pérdida Bruta|Pérdida Probable|Reserva Determinada|Pérdida Estimada)[^\d]*([\d\.,]+)', texto, re.IGNORECASE)
     if matches_bruta:
-        datos["Texto_Monto_Crudo"] = matches_bruta[-1] # Guardamos el texto exacto capturado para diagnóstico
+        datos["Texto_Monto_Crudo"] = matches_bruta[-1]
         datos["Perdida_Bruta"] = limpiar_monto(matches_bruta[-1])
     
+    # 9. Divisa
     if re.search(r'\bUF\b', texto, re.IGNORECASE): datos["Divisa"] = "UF"
     elif re.search(r'\b(US\$|USD|D[OÓ]LARES|US \$)\b', texto, re.IGNORECASE): datos["Divisa"] = "US$"
     elif re.search(r'\b(PESOS|CLP|\$)\b', texto, re.IGNORECASE): datos["Divisa"] = "PESOS"
@@ -140,9 +163,13 @@ def generar_word_individual(resultado):
     estado = "❌ OBSERVADO" if resultado['Detalles_Criticos'] else "✅ APROBADO"
     doc.add_heading(f'2. RESULTADO DETALLADO: {estado}', level=1)
 
+    # Secciones totalmente separadas en el Word
     sections = [
         ("Póliza de Seguros", resultado['Detalles_Poliza']),
         ("Compañía de Seguros", resultado['Detalles_Compania']),
+        ("Corredora", resultado['Detalles_Corredora']),
+        ("Identificación del Asegurado", resultado['Detalles_Asegurado']),
+        ("Ubicación (Dirección, Comuna, Región)", resultado['Detalles_Ubicacion']),
         ("Firma / Ajustador Senior", resultado['Detalles_Firmas']),
         ("Fechas (Siniestro y Denuncia)", resultado['Detalles_Fechas']),
         ("Financiera (Pérdida Bruta y Divisa)", resultado['Detalles_Monto'])
