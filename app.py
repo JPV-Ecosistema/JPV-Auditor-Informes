@@ -214,26 +214,52 @@ if st.session_state.df_maestro is not None:
                 # Arrays separados rigurosamente para cada análisis
                 detalles_poliza = []
                 detalles_compania = []
+                detalles_corredora = []
+                detalles_asegurado = []
+                detalles_ubicacion = []
                 detalles_firmas = []
                 detalles_fechas = []
                 detalles_monto = []
 
-                # 1. Cruce de Póliza Separado
+                # 1. Póliza
                 poliza_sist = str(fila.get('Póliza de seguros', '')).strip()
                 if poliza_sist.upper() not in str(datos_doc["Poliza"]).upper() and poliza_sist != "nan" and poliza_sist != "":
                     detalles_poliza.append(f"Póliza: Sist({poliza_sist}) vs Doc({datos_doc['Poliza']})")
                 
-                # 2. Cruce de Asegurador Separado
+                # 2. Compañía de Seguros (Aseguradora)
                 comp_sist = str(fila.get('Compañía de seguros', '')).strip().upper()
-                if datos_doc["Compania"] and comp_sist not in datos_doc["Compania"].upper():
-                    detalles_compania.append(f"Asegurador: Sist({comp_sist}) vs Doc({datos_doc['Compania']})")
+                if datos_doc["Compania"] and comp_sist not in datos_doc["Compania"].upper() and comp_sist != "NAN":
+                    detalles_compania.append(f"Aseguradora: Sist({comp_sist}) vs Doc({datos_doc['Compania']})")
 
-                # 3. Cruce de Firmas / Ajustador Separado
+                # 3. Corredora
+                corr_sist = str(fila.get('Corredora', '')).strip().upper()
+                if datos_doc["Corredora"] and corr_sist not in datos_doc["Corredora"].upper() and corr_sist != "NAN":
+                    detalles_corredora.append(f"Corredora: Sist({corr_sist}) vs Doc({datos_doc['Corredora']})")
+
+                # 4. Asegurado
+                aseg_sist = str(fila.get('Asegurado', '')).strip().upper()
+                if datos_doc["Asegurado"] and aseg_sist not in datos_doc["Asegurado"].upper() and aseg_sist != "NAN":
+                    detalles_asegurado.append(f"Asegurado: Sist({aseg_sist}) vs Doc({datos_doc['Asegurado']})")
+
+                # 5. Ubicación (Dirección, Comuna, Región)
+                dir_sist = str(fila.get('Dirección', '')).strip().upper()
+                if datos_doc["Direccion"] and dir_sist not in datos_doc["Direccion"].upper() and dir_sist != "NAN":
+                    detalles_ubicacion.append(f"Dirección: Sist({dir_sist}) vs Doc({datos_doc['Direccion']})")
+
+                com_sist = str(fila.get('Comuna', '')).strip().upper()
+                if datos_doc["Comuna"] and com_sist not in datos_doc["Comuna"].upper() and com_sist != "NAN":
+                    detalles_ubicacion.append(f"Comuna: Sist({com_sist}) vs Doc({datos_doc['Comuna']})")
+
+                reg_sist = str(fila.get('Región', '')).strip().upper()
+                if datos_doc["Region"] and reg_sist not in datos_doc["Region"].upper() and reg_sist != "NAN":
+                    detalles_ubicacion.append(f"Región: Sist({reg_sist}) vs Doc({datos_doc['Region']})")
+
+                # 6. Firmas / Ajustador Senior
                 ajust_sist = str(fila.get('Ajustador senior', '')).strip().upper()
                 if datos_doc["Ajustador"] and ajust_sist not in datos_doc["Ajustador"].upper() and ajust_sist != "NAN":
                     detalles_firmas.append(f"Ajustador: Sist({ajust_sist}) vs Doc({datos_doc['Ajustador']})")
 
-                # 4. Cruce de Fechas Exactas Separado
+                # 7. Fechas Exactas
                 f_ocurr = str(fila.get('Fecha de ocurrencia', '')).strip()
                 if datos_doc["Fecha_Siniestro"] and datos_doc["Fecha_Siniestro"][:10] not in f_ocurr:
                     detalles_fechas.append(f"Fecha Ocurrencia: Sist({f_ocurr}) vs Doc({datos_doc['Fecha_Siniestro']})")
@@ -242,7 +268,7 @@ if st.session_state.df_maestro is not None:
                 if datos_doc["Fecha_Denuncia"] and datos_doc["Fecha_Denuncia"][:10] not in f_denun:
                     detalles_fechas.append(f"Fecha Denuncio: Sist({f_denun}) vs Doc({datos_doc['Fecha_Denuncia']})")
 
-                # 5. Cruce Financiero y Monto Separado
+                # 8. Cruce Financiero y Divisa
                 bruta_sist = limpiar_monto(fila.get('Perdida bruta (en moneda del caso)', 0))
                 if abs(datos_doc["Perdida_Bruta"] - bruta_sist) > 1.0:
                     detalles_monto.append(f"Monto Bruto: Sist({bruta_sist:,.2f}) vs Doc({datos_doc['Perdida_Bruta']:,.2f}) [Texto extraído: '{datos_doc['Texto_Monto_Crudo']}']")
@@ -252,13 +278,16 @@ if st.session_state.df_maestro is not None:
                     detalles_monto.append(f"Divisa: Sist({div_sist}) vs Doc({datos_doc['Divisa']})")
 
                 # Consolidación de Resultados
-                todos_los_errores = detalles_poliza + detalles_compania + detalles_firmas + detalles_fechas + detalles_monto
+                todos_los_errores = detalles_poliza + detalles_compania + detalles_corredora + detalles_asegurado + detalles_ubicacion + detalles_firmas + detalles_fechas + detalles_monto
                 
                 res_final = {
                     "Documento": archivo_informe.name,
                     "N° Caso": datos_doc["Liquidacion"],
                     "Detalles_Poliza": detalles_poliza,
                     "Detalles_Compania": detalles_compania,
+                    "Detalles_Corredora": detalles_corredora,
+                    "Detalles_Asegurado": detalles_asegurado,
+                    "Detalles_Ubicacion": detalles_ubicacion,
                     "Detalles_Firmas": detalles_firmas,
                     "Detalles_Fechas": detalles_fechas,
                     "Detalles_Monto": detalles_monto,
@@ -268,12 +297,12 @@ if st.session_state.df_maestro is not None:
                 estado_visual = "❌ Con Observaciones" if todos_los_errores else "✅ Aprobado"
                 st.success(f"Auditoría Finalizada. Estado: {estado_visual}")
                 
-                # Métricas visuales desglosadas al 100%
+                # Métricas visuales en pantalla desglosadas (Se muestran las más críticas, el resto en el detalle)
                 c1, c2, c3, c4, c5 = st.columns(5)
                 c1.metric("Póliza", "❌" if detalles_poliza else "✅")
-                c2.metric("Compañía", "❌" if detalles_compania else "✅")
-                c3.metric("Firma", "❌" if detalles_firmas else "✅")
-                c4.metric("Fechas", "❌" if detalles_fechas else "✅")
+                c2.metric("Compañía/Corredor", "❌" if (detalles_compania or detalles_corredora) else "✅")
+                c3.metric("Asegurado/Ubicación", "❌" if (detalles_asegurado or detalles_ubicacion) else "✅")
+                c4.metric("Ajustador/Fechas", "❌" if (detalles_firmas or detalles_fechas) else "✅")
                 c5.metric("Monto/Divisa", "❌" if detalles_monto else "✅")
 
                 if todos_los_errores:
